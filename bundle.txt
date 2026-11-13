@@ -1,0 +1,519 @@
+=== app/build.gradle.kts ===
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+android {
+    namespace = "com.keystudio.kb"
+    compileSdk = 34
+    defaultConfig {
+        applicationId = "com.keystudio.kb"
+        minSdk = 24
+        targetSdk = 34
+        versionCode = 1
+        versionName = "1.0"
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = "17" }
+}
+=== app/src/main/AndroidManifest.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <queries>
+        <intent><action android:name="android.speech.RecognitionService" /></intent>
+    </queries>
+    <application
+        android:label="Keyboard Studio"
+        android:icon="@android:drawable/sym_def_app_icon"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <service
+            android:name=".KeyService"
+            android:label="Keyboard Studio"
+            android:exported="true"
+            android:permission="android.permission.BIND_INPUT_METHOD">
+            <intent-filter><action android:name="android.view.InputMethod" /></intent-filter>
+            <meta-data android:name="android.view.im" android:resource="@xml/method" />
+        </service>
+        <activity android:name=".SettingsActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+=== app/src/main/java/com/keystudio/kb/KeyService.kt ===
+package com.keystudio.kb
+
+import android.Manifest
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.inputmethodservice.InputMethodService
+import android.os.Bundle
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.view.KeyEvent
+import android.view.View
+import android.view.inputmethod.EditorInfo
+
+class KeyService : InputMethodService(), KbListener {
+    private var view: KeyboardView? = null
+    private var rec: SpeechRecognizer? = null
+
+    override fun onCreateInputView(): View {
+        val v = KeyboardView(this)
+        v.listener = this
+        v.reload()
+        view = v
+        return v
+    }
+
+    override fun onEvaluateFullscreenMode(): Boolean = false
+
+    override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
+        super.onStartInputView(info, restarting)
+        view?.reload()
+    }
+
+    override fun onFinishInputView(finishingInput: Boolean) {
+        super.onFinishInputView(finishingInput)
+        stopVoice()
+    }
+
+    override fun onText(s: String) {
+        currentInputConnection?.commitText(s, 1)
+    }
+
+    override fun onDelete() {
+        sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
+    }
+
+    override fun onEnter() {
+        val opts = currentInputEditorInfo?.imeOptions ?: 0
+        val a = opts and EditorInfo.IME_MASK_ACTION
+        val noEnter = (opts and EditorInfo.IME_FLAG_NO_ENTER_ACTION) != 0
+        if (!noEnter && a != EditorInfo.IME_ACTION_NONE && a != EditorInfo.IME_ACTION_UNSPECIFIED) {
+            currentInputConnection?.performEditorAction(a)
+        } else {
+            sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
+        }
+    }
+
+    override fun onSettings() {
+        startActivity(Intent(this, SettingsActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    }
+
+    override fun getClips(): List<String> {
+        val p = getSharedPreferences("ks", 0)
+        val list = ArrayList<String>()
+        val saved = p.getString("clips", "") ?: ""
+        if (saved.isNotEmpty()) list.addAll(saved.split("\u0001"))
+        try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val t = cm.primaryClip?.getItemAt(0)?.text?.toString()
+            if (!t.isNullOrBlank()) {
+                list.remove(t)
+                list.add(0, t)
+            }
+        } catch (e: Exception) {
+        }
+        val out = list.take(20)
+        p.edit().putString("clips", out.joinToString("\u0001")).apply()
+        return out
+    }
+
+    private fun stopVoice() {
+        rec?.destroy()
+        rec = null
+        view?.listening = false
+    }
+
+    override fun onVoice() {
+        if (rec != null) {
+            stopVoice()
+            return
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            startActivity(
+                Intent(this, SettingsActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK).putExtra("perm", true)
+            )
+            return
+        }
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) return
+        val r = SpeechRecognizer.createSpeechRecognizer(this)
+        r.setRecognitionListener(object : RecognitionListener {
+            override fun onReadyForSpeech(params: Bundle?) {}
+            override fun onBeginningOfSpeech() {}
+            override fun onRmsChanged(rmsdB: Float) {}
+            override fun onBufferReceived(buffer: ByteArray?) {}
+            override fun onEndOfSpeech() {}
+            override fun onError(error: Int) { stopVoice() }
+            override fun onPartialResults(partialResults: Bundle?) {}
+            override fun onEvent(eventType: Int, params: Bundle?) {}
+            override fun onResults(results: Bundle?) {
+                val t = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                if (!t.isNullOrBlank()) onText("$t ")
+                stopVoice()
+            }
+        })
+        val tag = mapOf("ru" to "ru-RU", "en" to "en-US", "uk" to "uk-UA", "de" to "de-DE")[view?.lang ?: "ru"] ?: "ru-RU"
+        val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, tag)
+        rec = r
+        view?.listening = true
+        r.startListening(i)
+    }
+
+    override fun onDestroy() {
+        stopVoice()
+        super.onDestroy()
+    }
+}
+=== app/src/main/java/com/keystudio/kb/KeyboardView.kt ===
+package com.keystudio.kb
+
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.LinearGradient
+import android.graphics.Paint
+import android.graphics.RadialGradient
+import android.graphics.Shader
+import android.os.Handler
+import android.os.Looper
+import android.util.TypedValue
+import android.view.HapticFeedbackConstants
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewConfiguration
+import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sin
+import kotlin.math.sqrt
+import kotlin.random.Random
+
+fun c(s: String): Int = Color.parseColor(s)
+fun withA(col: Int, a: Int): Int = (col and 0x00FFFFFF) or (a shl 24)
+
+class Theme(
+    val name: String, val bg1: Int, val bg2: Int, val key: Int,
+    val text: Int, val acc: Int, val g2: Int, val ka: Int
+)
+
+val THEMES = listOf(
+    Theme("Неон", c("#1b0b3a"), c("#05061a"), c("#b9a6ff"), c("#f4eeff"), c("#ff3df2"), c("#3d7bff"), 70),
+    Theme("Сакура", c("#ffe3ec"), c("#ffbfd4"), c("#ffffff"), c("#5a1f3b"), c("#ff6f9c"), c("#ffd0a8"), 235),
+    Theme("Космос", c("#0b1230"), c("#241046"), c("#9fb4ff"), c("#eaf0ff"), c("#5ad1ff"), c("#9b5cff"), 60),
+    Theme("Мята", c("#e2f8ef"), c("#b9ecdc"), c("#ffffff"), c("#0f4a3d"), c("#18c29c"), c("#8fe3ff"), 235),
+    Theme("Закат", c("#3a1450"), c("#1a0b2a"), c("#ffd1b8"), c("#fff1e8"), c("#ff7a45"), c("#ff3d77"), 60),
+    Theme("Аврора", c("#06222b"), c("#0b0f2e"), c("#a8ffe0"), c("#e8fff7"), c("#4dffb4"), c("#8a5cff"), 55),
+    Theme("Океан", c("#062a4a"), c("#021428"), c("#9bdcff"), c("#eaf8ff"), c("#2ec4ff"), c("#00e0c0"), 60),
+    Theme("Лаванда", c("#efe8ff"), c("#d7c9ff"), c("#ffffff"), c("#2f1f66"), c("#8b6cff"), c("#ff9ad5"), 235),
+    Theme("Графит", c("#1b1c20"), c("#0c0c0f"), c("#d0d0d8"), c("#f4f4f7"), c("#e8e8ee"), c("#5b6cff"), 55),
+    Theme("Ретровейв", c("#2b0a4a"), c("#0d0221"), c("#ff9de6"), c("#ffeafc"), c("#ff2e97"), c("#00e5ff"), 60),
+    Theme("Золото", c("#1c1608"), c("#0a0802"), c("#f6e3a8"), c("#fff7dd"), c("#f2c14e"), c("#b8862b"), 55),
+    Theme("Леденец", c("#fff1f7"), c("#ffe0ee"), c("#ffffff"), c("#7a1f47"), c("#ff5c8a"), c("#7cf0ff"), 235)
+)
+
+val FXNAMES = listOf("Искры", "Сердечки", "Звёзды", "Конфетти", "Пузыри", "Волны", "Снег", "Выкл")
+
+val LAYOUT = mapOf(
+    "ru" to listOf("йцукенгшщзх", "фывапролджэ", "ячсмитьбю"),
+    "en" to listOf("qwertyuiop", "asdfghjkl", "zxcvbnm"),
+    "uk" to listOf("йцукенгшщзхї", "фівапролджє", "ячсмитьбю"),
+    "de" to listOf("qwertzuiop", "asdfghjklö", "yxcvbnm"),
+    "num" to listOf("1234567890", "-/:;()₽&@\"", ".,?!'")
+)
+
+val DICT: Map<String, List<String>> = run {
+    val ru = "привет как дела спасибо пожалуйста хорошо давай сегодня завтра что это мы да нет где когда почему люблю пока добрый день вечер утро работа дом друг жизнь время можно нужно буду идем сейчас тоже очень конечно".split(" ")
+    val en = "hello how are you thanks please good morning night today tomorrow what this that love friend time work home yes okay great see later the and with just come going".split(" ")
+    val de = "hallo danke bitte gut morgen heute wie geht dir ja nein ich liebe dich freund zeit".split(" ")
+    mapOf("ru" to ru, "uk" to ru, "en" to en, "de" to de)
+}
+
+interface KbListener {
+    fun onText(s: String)
+    fun onDelete()
+    fun onEnter()
+    fun onVoice()
+    fun onSettings()
+    fun getClips(): List<String>
+}
+
+private enum class Mode { ABC, NUM, EMOJI, CLIP }
+
+class Key(val label: String, val code: String, val letter: Boolean = false, val style: Int = 0) {
+    var x = 0f
+    var y = 0f
+    var w = 0f
+    var h = 0f
+    var p = 0f
+    var down = false
+    fun hit(px: Float, py: Float, s: Float): Boolean = px >= x - s && px <= x + w + s && py >= y - s && py <= y + h + s
+}
+
+private class Spec(val l: String, val code: String, val span: Int, val letter: Boolean = false, val style: Int = 0)
+private class Particle(
+    var x: Float, var y: Float, var vx: Float, var vy: Float, val g: Float, var life: Float,
+    val max: Float, val s: Float, val col: Int, val type: Int, var r: Float, val vr: Float
+)
+private class TrailPt(val x: Float, val y: Float, var l: Float)
+
+class KeyboardView(ctx: Context) : View(ctx) {
+    var listener: KbListener? = null
+    var listening = false
+    var lang = "ru"
+
+    private val dens = resources.displayMetrics.density
+    private fun dp(v: Float) = v * dens
+    private fun sp(v: Float) = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, v, resources.displayMetrics)
+    private val prefs = ctx.getSharedPreferences("ks", 0)
+    private val slop = ViewConfiguration.get(ctx).scaledTouchSlop.toFloat()
+    private val handler = Handler(Looper.getMainLooper())
+
+    private var theme = THEMES[0]
+    private var fx = 0
+    private var mascotOn = true
+    private var haptic = true
+    private var swipeOn = true
+    private var langs = listOf("ru", "en")
+    private var mode = Mode.ABC
+    private var shift = false
+
+    private val tools = ArrayList<Key>()
+    private val bottom = ArrayList<Key>()
+    private val keys = ArrayList<Key>()
+    private var clipList: List<String> = emptyList()
+    private var scrollY = 0f
+    private var contentH = 0f
+    private var panelTop = 0f
+    private var panelBottom = 0f
+    private var rad = 0f
+    private var gapPx = 0f
+
+    private val emojis: List<String> by lazy {
+        val out = ArrayList<String>()
+        val ranges = listOf(
+            0x1F600..0x1F64F, 0x1F970..0x1F978, 0x1F400..0x1F43E, 0x1F330..0x1F37F,
+            0x1F380..0x1F3CA, 0x1F4A0..0x1F4FC, 0x1F680..0x1F6A4
+        )
+        for (r in ranges) for (cp in r) out.add(String(Character.toChars(cp)))
+        out.addAll(listOf("❤️", "🧡", "💛", "💚", "💙", "💜", "🖤", "🤍", "💔", "✨", "⭐", "⚡", "☀️", "❄️", "✅", "❌", "❗", "❓", "♥", "♪"))
+        out
+    }
+
+    private val bgP = Paint()
+    private val b1 = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val b2 = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val kp = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val tp = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
+    private val pp = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val mp = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val trailP = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeCap = Paint.Cap.ROUND }
+    private var blobR = 100f
+
+    private val ps = ArrayList<Particle>()
+    private val trail = ArrayList<TrailPt>()
+
+    // mascot spring state
+    private var mx = 100f
+    private var my = 80f
+    private var mvx = 0f
+    private var mvy = 0f
+    private var mr = 0f
+    private var mvr = 0f
+    private var ms = 0f
+    private var mvs = 0f
+    private var pull = 0f
+    private var hx = 0f
+    private var hy = 0f
+
+    private var tt = 0f
+    private var lastNs = 0L
+    private var running = false
+
+    // touch state
+    private var active: Key? = null
+    private var deferred = false
+    private val swipePath = ArrayList<Key>()
+    private var downY = 0f
+    private var lastY = 0f
+    private var scrolling = false
+    private val repeater = object : Runnable {
+        override fun run() {
+            listener?.onDelete()
+            handler.postDelayed(this, 55)
+        }
+    }
+
+    fun reload() {
+        theme = THEMES[prefs.getInt("theme", 0).coerceIn(0, THEMES.size - 1)]
+        fx = prefs.getInt("fx", 0).coerceIn(0, FXNAMES.size - 1)
+        mascotOn = prefs.getBoolean("mascot", true)
+        haptic = prefs.getBoolean("haptic", true)
+        swipeOn = prefs.getBoolean("swipe", true)
+        val set = prefs.getStringSet("langs", setOf("ru", "en")) ?: setOf("ru", "en")
+        langs = listOf("ru", "en", "uk", "de").filter { set.contains(it) }
+        if (langs.isEmpty()) langs = listOf("ru")
+        if (!langs.contains(lang)) lang = langs[0]
+        rebuildShaders()
+        layoutKeys()
+        invalidate()
+    }
+
+    override fun onMeasure(wSpec: Int, hSpec: Int) {
+        val w = MeasureSpec.getSize(wSpec)
+        val h = dp(6f) + dp(38f) + dp(5f) + 4 * (dp(46f) + dp(5f)) + dp(2f)
+        setMeasuredDimension(w, h.toInt())
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
+        super.onSizeChanged(w, h, ow, oh)
+        rebuildShaders()
+        layoutKeys()
+    }
+
+    private fun rebuildShaders() {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        if (w <= 0f) return
+        bgP.shader = LinearGradient(0f, 0f, w * 0.4f, h, theme.bg1, theme.bg2, Shader.TileMode.CLAMP)
+        blobR = max(w, h) * 0.6f
+        b1.shader = RadialGradient(0f, 0f, blobR, withA(theme.acc, 95), withA(theme.acc, 0), Shader.TileMode.CLAMP)
+        b2.shader = RadialGradient(0f, 0f, blobR, withA(theme.g2, 95), withA(theme.g2, 0), Shader.TileMode.CLAMP)
+    }
+
+    private fun layoutKeys() {
+        val w = width.toFloat()
+        if (w <= 0f) return
+        val pad = dp(5f)
+        val gap = dp(5f)
+        val kh = dp(46f)
+        val th = dp(38f)
+        gapPx = gap
+        rad = dp(11f)
+        val colW = (w - 2 * pad - 23 * gap) / 24f
+        tools.clear(); bottom.clear(); keys.clear()
+        val tn = listOf(
+            "t:emoji" to "😊", "t:clip" to "📋", "t:voice" to "🎤", "t:num" to "123",
+            "t:theme" to "🎨", "t:fx" to "✨", "t:set" to "⚙"
+        )
+        val tw = (w - 2 * pad - (tn.size - 1) * gap) / tn.size
+        tn.forEachIndexed { i, pr ->
+            val k = Key(pr.second, pr.first, false, 1)
+            k.x = pad + i * (tw + gap); k.y = dp(6f); k.w = tw; k.h = th
+            tools.add(k)
+        }
+        panelTop = dp(6f) + th + gap
+        panelBottom = panelTop + 3 * kh + 2 * gap
+
+        fun place(list: ArrayList<Key>, y: Float, specs: List<Spec>) {
+            var col = 0
+            for (s in specs) {
+                if (s.code.isNotEmpty()) {
+                    val k = Key(s.l, s.code, s.letter, s.style)
+                    k.x = pad + col * (colW + gap)
+                    k.y = y
+                    k.w = s.span * colW + (s.span - 1) * gap
+                    k.h = kh
+                    list.add(k)
+                }
+                col += s.span
+            }
+        }
+
+        contentH = 0f
+        when (mode) {
+            Mode.ABC, Mode.NUM -> {
+                val rows = if (mode == Mode.NUM) LAYOUT["num"]!! else LAYOUT[lang]!!
+                rows.forEachIndexed { i, r ->
+                    val chars = r.map { it.toString() }
+                    val n = chars.size
+                    val last = i == 2
+                    val side = if (last) min(4, 12 - n) else 0
+                    val pd = (24 - 2 * n - 2 * side) / 2
+                    val specs = ArrayList<Spec>()
+                    if (pd > 0) specs.add(Spec("", "", pd))
+                    if (last) {
+                        if (mode == Mode.ABC) specs.add(Spec(if (shift) "⇧" else "⇪", "shift", side, false, if (shift) 2 else 1))
+                        else specs.add(Spec("", "", side))
+                    }
+                    for (ch in chars) {
+                        specs.add(Spec(if (shift && mode == Mode.ABC) ch.uppercase() else ch, ch, 2, mode == Mode.ABC))
+                    }
+                    if (last) specs.add(Spec("⌫", "bs", side, false, 1))
+                    if (pd > 0) specs.add(Spec("", "", pd))
+                    place(keys, panelTop + i * (kh + gap), specs)
+                }
+            }
+            Mode.EMOJI -> {
+                val cw = (w - 2 * pad) / 8f
+                emojis.forEachIndexed { i, e ->
+                    val k = Key(e, e, false, 5)
+                    k.x = pad + (i % 8) * cw; k.y = panelTop + (i / 8) * cw; k.w = cw; k.h = cw
+                    keys.add(k)
+                }
+                contentH = ceil(emojis.size / 8f) * cw
+            }
+            Mode.CLIP -> {
+                if (clipList.isEmpty()) {
+                    val k = Key("Буфер пуст — скопируйте текст", "", false, 4)
+                    k.x = pad; k.y = panelTop; k.w = w - 2 * pad; k.h = kh
+                    keys.add(k)
+                }
+                clipList.forEachIndexed { i, s ->
+                    val k = Key(s.replace("\n", " ").take(38), "clip:$i", false, 1)
+                    k.x = pad; k.y = panelTop + i * (kh + gap); k.w = w - 2 * pad; k.h = kh
+                    keys.add(k)
+                }
+                contentH = clipList.size * (kh + gap)
+            }
+        }
+        val by = panelTop + 3 * (kh + gap)
+        place(
+            bottom, by, listOf(
+                Spec(if (mode == Mode.NUM) "АБВ" else "?123", "t:num", 4, false, 1),
+                Spec("🌐", "t:lang", 3, false, 1),
+                Spec(lang.uppercase(), " ", 10, false, 1),
+                Spec(".", ".", 3),
+                Spec("↵", "enter", 4, false, 3)
+            )
+        )
+        val maxS = max(0f, contentH - (panelBottom - panelTop))
+        scrollY = scrollY.coerceIn(0f, maxS)
+    }
+
+    // ---------- drawing ----------
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        start()
+    }
+
+    override fun onDetachedFromWindow() {
+        running = false
+        handler.removeCallbacks(repeater)
+        super.onDetachedFromWindow()
+    }
+
+    override fun onWindowVisibilityChanged(v: Int) {
+        super.onWindowVisibilityChanged(v)
+        if (v == VISIBLE) start() else running = false
+    }
+
+    private fun start() {
+        if (!running) {
+            running = true
+          
