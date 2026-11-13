@@ -1,0 +1,56 @@
+name: Build APK
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch: {}
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack project from bundle
+        run: |
+          python3 - <<'PY'
+          import re, os, glob, sys
+          if os.path.exists('settings.gradle.kts'):
+              print('Project already unpacked, skipping')
+              sys.exit(0)
+          cands = sorted(glob.glob('bundle*'))
+          print('Files in repo root:', os.listdir('.'))
+          if not cands:
+              print('ERROR: bundle.txt not found in repo root')
+              sys.exit(1)
+          t = open(cands[0], encoding='utf-8-sig').read().replace('\r\n', '\n')
+          n = 0
+          for m in re.finditer(r'^=== (.+?) ===\n(.*?)(?=^=== |\Z)', t, re.S | re.M):
+              p = m.group(1).strip()
+              os.makedirs(os.path.dirname(p) or '.', exist_ok=True)
+              open(p, 'w', encoding='utf-8').write(m.group(2))
+              n += 1
+              print('unpacked', p)
+          if n == 0:
+              print('ERROR: no files found inside', cands[0])
+              sys.exit(1)
+          PY
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+      - name: Publish APK to Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk KeyboardStudio.apk
+          gh release delete latest -y --cleanup-tag || true
+          gh release create latest KeyboardStudio.apk --title "Keyboard Studio" --notes "Debug build ${{ github.sha }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KeyboardStudio-apk
+          path: KeyboardStudio.apk
